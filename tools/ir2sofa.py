@@ -31,7 +31,8 @@ def export_sofa(filename, out_dir="."):
         is_int16 = (pl.get('CoefficientFormat') == 'int16')
         coeff_format_size = 2 if is_int16 else 4
         
-        record_size = num_dims * coord_format_size + num_channels * delay_format_size + num_channels * filter_length * coeff_format_size
+        chan_data_size = filter_length * coeff_format_size + delay_format_size
+        record_size = num_dims * coord_format_size + num_channels * chan_data_size
         
         payload_offset = 4 + length
         f.seek(payload_offset)
@@ -44,6 +45,7 @@ def export_sofa(filename, out_dir="."):
         az_idx = dim_names.index('azimuth') if 'azimuth' in dim_names else -1
         el_idx = dim_names.index('elevation') if 'elevation' in dim_names else -1
         
+        chan_coeff_bytes = filter_length * coeff_format_size
         for i in range(total_coords):
             record = f.read(record_size)
             if len(record) < record_size:
@@ -62,22 +64,19 @@ def export_sofa(filename, out_dir="."):
                 
             source_positions[i] = [az, el, r]
             
-            delay_offset = num_dims * 4
-            delay_bytes = record[delay_offset : delay_offset + num_channels * delay_format_size]
-            if delay_format_size > 0:
-                delays[i] = struct.unpack(f'<{num_channels}f', delay_bytes)
+            offset = num_dims * 4
+            for c in range(num_channels):
+                c_bytes = record[offset : offset + chan_coeff_bytes]
+                offset += chan_coeff_bytes
+                if is_int16:
+                    c_data = struct.unpack(f'<{filter_length}h', c_bytes)
+                else:
+                    c_data = struct.unpack(f'<{filter_length}f', c_bytes)
+                ir_data[i, c, :] = np.array(c_data, dtype=np.float64) * scale_factor
                 
-            coeff_offset = delay_offset + num_channels * delay_format_size
-            coeff_bytes = record[coeff_offset:]
-            
-            if is_int16:
-                coeffs = struct.unpack(f'<{num_channels * filter_length}h', coeff_bytes)
-            else:
-                coeffs = struct.unpack(f'<{num_channels * filter_length}f', coeff_bytes)
-            
-            c_array = np.array(coeffs, dtype=np.float64).reshape((num_channels, filter_length))
-            c_array *= scale_factor
-            ir_data[i] = c_array
+                if delay_format_size > 0:
+                    delays[i, c] = struct.unpack('<f', record[offset : offset + delay_format_size])[0]
+                    offset += delay_format_size
             
         base_name = os.path.splitext(os.path.basename(filename))[0]
         out_path = os.path.join(out_dir, f"{base_name}.sofa")
@@ -100,7 +99,7 @@ def export_sofa(filename, out_dir="."):
         root.DataType = "FIR"
         root.RoomType = "free field"
         root.Title = pl.get('Description', base_name)
-        root.DateCreated = datetime.datetime.utcnow().isoformat() + 'Z'
+        root.DateCreated = datetime.datetime.now(datetime.timezone.utc).isoformat()
         root.DateModified = root.DateCreated
         root.DatabaseName = "Apple Spatial Audio IRs"
         root.ListenerShortName = "Apple Head"

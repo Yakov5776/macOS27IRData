@@ -23,7 +23,8 @@ def export_wav(filename, out_dir="."):
         is_int16 = (pl.get('CoefficientFormat') == 'int16')
         coeff_format_size = 2 if is_int16 else 4
         
-        record_size = num_dims * coord_format_size + num_channels * delay_format_size + num_channels * filter_length * coeff_format_size
+        chan_data_size = filter_length * coeff_format_size + delay_format_size
+        record_size = num_dims * coord_format_size + num_channels * chan_data_size
         
         # Read the payload
         payload_offset = 4 + length
@@ -38,6 +39,7 @@ def export_wav(filename, out_dir="."):
         
         print(f"Exporting {total_coords} IRs from {filename} to {out_dir}/ ...")
         
+        chan_coeff_bytes = filter_length * coeff_format_size
         for i in range(total_coords):
             record = f.read(record_size)
             if len(record) < record_size:
@@ -46,20 +48,24 @@ def export_wav(filename, out_dir="."):
             coord_bytes = record[0 : num_dims*4]
             coords = struct.unpack(f'<{num_dims}f', coord_bytes)
             
-            coeff_offset = num_dims * 4 + num_channels * delay_format_size
-            coeff_bytes = record[coeff_offset:]
+            channel_coeffs = []
+            offset = num_dims * 4
+            for c in range(num_channels):
+                c_bytes = record[offset : offset + chan_coeff_bytes]
+                offset += chan_coeff_bytes
+                if is_int16:
+                    c_data = struct.unpack(f'<{filter_length}h', c_bytes)
+                else:
+                    c_data = struct.unpack(f'<{filter_length}f', c_bytes)
+                channel_coeffs.append(c_data)
+                offset += delay_format_size
             
-            if is_int16:
-                coeffs = struct.unpack(f'<{num_channels * filter_length}h', coeff_bytes)
-            else:
-                coeffs = struct.unpack(f'<{num_channels * filter_length}f', coeff_bytes)
-            
-            # The format is planar: [C0_0, C0_1 ... C0_N], [C1_0, C1_1 ... C1_N]
+            # The format stores each channel sequentially:
             # WAV expects interleaved: [C0_0, C1_0, C0_1, C1_1 ...]
             interleaved = []
             for s in range(filter_length):
                 for c in range(num_channels):
-                    val = coeffs[c * filter_length + s]
+                    val = channel_coeffs[c][s]
                     if is_int16:
                         # Convert to float and apply scale factor
                         f_val = val * scale_factor

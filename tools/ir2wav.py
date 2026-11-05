@@ -1,101 +1,36 @@
-#!/usr/bin/env python3
-import struct
-import plistlib
-import sys
-import os
-import wave
+"""Export float WAV coefficient arrays plus timing/coordinate sidecar."""
+import argparse, json, struct
+from pathlib import Path
+from apple_formats import IR, json_value
 
-def export_wav(filename, out_dir="."):
-    with open(filename, 'rb') as f:
-        hdr = f.read(4)
-        length = struct.unpack('<I', hdr)[0]
-        pl = plistlib.loads(f.read(length))
-        
-        num_dims = len(pl.get('Dimensions', []))
-        num_channels = pl.get('NumChannels', 1)
-        filter_length = pl.get('FilterLength', 0)
-        total_coords = pl.get('TotalNumCoordinates', 1)
-        scale_factor = pl.get('FilterScaleFactor', 1.0)
-        sample_rate = int(pl.get('SampleRate', 48000))
-        
-        coord_format_size = 4
-        delay_format_size = 4 if pl.get('DelayFormat') == 'float32' else 0
-        is_int16 = (pl.get('CoefficientFormat') == 'int16')
-        coeff_format_size = 2 if is_int16 else 4
-        
-        chan_data_size = filter_length * coeff_format_size + delay_format_size
-        record_size = num_dims * coord_format_size + num_channels * chan_data_size
-        
-        # Read the payload
-        payload_offset = 4 + length
-        f.seek(payload_offset)
-        
-        base_name = os.path.splitext(os.path.basename(filename))[0]
-        
-        # Create a subfolder if there are many records
-        if total_coords > 1:
-            out_dir = os.path.join(out_dir, base_name)
-        os.makedirs(out_dir, exist_ok=True)
-        
-        print(f"Exporting {total_coords} IRs from {filename} to {out_dir}/ ...")
-        
-        chan_coeff_bytes = filter_length * coeff_format_size
-        for i in range(total_coords):
-            record = f.read(record_size)
-            if len(record) < record_size:
-                break
-                
-            coord_bytes = record[0 : num_dims*4]
-            coords = struct.unpack(f'<{num_dims}f', coord_bytes)
-            
-            channel_coeffs = []
-            offset = num_dims * 4
-            for c in range(num_channels):
-                c_bytes = record[offset : offset + chan_coeff_bytes]
-                offset += chan_coeff_bytes
-                if is_int16:
-                    c_data = struct.unpack(f'<{filter_length}h', c_bytes)
-                else:
-                    c_data = struct.unpack(f'<{filter_length}f', c_bytes)
-                channel_coeffs.append(c_data)
-                offset += delay_format_size
-            
-            # The format stores each channel sequentially:
-            # WAV expects interleaved: [C0_0, C1_0, C0_1, C1_1 ...]
-            interleaved = []
-            for s in range(filter_length):
-                for c in range(num_channels):
-                    val = channel_coeffs[c][s]
-                    if is_int16:
-                        # Convert to float and apply scale factor
-                        f_val = val * scale_factor
-                        f_val = max(min(f_val, 1.0), -1.0)
-                        interleaved.append(int(f_val * 32767.0))
-                    else:
-                        f_val = max(min(val, 1.0), -1.0)
-                        interleaved.append(int(f_val * 32767.0))
-            
-            # Pack interleaved data
-            wav_data = struct.pack(f'<{len(interleaved)}h', *interleaved)
-            
-            coord_str = "_".join(f"{c:g}" for c in coords)
-            if coord_str:
-                out_name = f"{base_name}_{i:04d}_coords_{coord_str}.wav"
-            else:
-                out_name = f"{base_name}_{i:04d}.wav"
-                
-            out_path = os.path.join(out_dir, out_name)
-            
-            with wave.open(out_path, 'wb') as w:
-                w.setnchannels(num_channels)
-                w.setsampwidth(2) # 16-bit
-                w.setframerate(sample_rate)
-                w.writeframes(wav_data)
+def export_wav(filename, out_dir='wav_output', scaling='stored'):
+    ir = IR(filename)
+    if ir.rate != int(ir.rate):
+        raise ValueError('WAV requires integral sample rate')
+    target = Path(out_dir)/ir.path.stem
+    target.mkdir(parents=True, exist_ok=True)
+    records = []
+    for i in range(ir.count):
+        coords, coeffs, delays = ir.record(i, scaling)
+        samples = [v for frame in zip(*coeffs) for v in frame]
+        data = struct.pack('<'+str(len(samples))+'f', *samples)
+        fmt = struct.pack('<HHIIHH', 3, ir.channels, int(ir.rate), int(ir.rate)*ir.channels*4, ir.channels*4, 32)
+        chunks = b'fmt '+struct.pack('<I', len(fmt))+fmt
+        chunks += b'fact'+struct.pack('<II', 4, ir.length)
+        chunks += b'data'+struct.pack('<I', len(data))+data
+        name = f'{ir.path.stem}_{i:04d}.wav'
+        (target/name).write_bytes(b'RIFF'+struct.pack('<I', len(chunks)+4)+b'WAVE'+chunks)
+        records.append(dict(file=name, coordinates=coords, stored_delays_samples=delays))
+    sidecar = dict(source=ir.path.name, scaling=scaling, delays_applied=False,
+        note='Coefficient arrays only; no interpolation, fractional-delay filter, room windows or host DSP.',
+        metadata=json_value(ir.metadata), records=records)
+    (target/'metadata.json').write_text(json.dumps(sidecar, indent=2)+'\n', encoding='utf-8')
+    print(f'Exported {ir.count} float WAVs and metadata.json to {target}')
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <file.ir> [out_dir]")
-        sys.exit(1)
-        
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else "wav_output"
-    export_wav(sys.argv[1], out_dir)
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('file')
+    p.add_argument('out_dir', nargs='?', default='wav_output')
+    p.add_argument('--scaling', choices=['stored','renderer'], default='stored')
+    a = p.parse_args()
+    export_wav(a.file, a.out_dir, a.scaling)

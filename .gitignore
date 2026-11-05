@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+wav_output/
+sofa_output/

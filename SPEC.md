@@ -1,106 +1,70 @@
-# Apple `.ir` File Format Specification
+# Apple IR container
 
-The `.ir` file format is Apple's binary container for Spatial Audio impulse-response datasets (HRIR, BRIR, SEIR, Reverb), implemented in `libAudioDSPCore` (within `AudioDSPCore`).
+## Container and records
 
----
+At offset 0 is a **little-endian uint32** metadata byte length L, followed by L bytes of binary property list beginning `bplist00`. The ordinary single-dataset payload begins at `4 + L`.
 
-## 1. Top-Level File Structure
+For D dimensions, C channels, N filter taps, coefficient width W, and optional delay width T:
 
-An `.ir` file consists of three contiguous sections:
-
-1. **Header (4 bytes):** 32-bit unsigned integer (Little-Endian) specifying the byte length of the binary metadata block.
-2. **Metadata Block (`length` bytes):** Apple Binary Property List (`bplist00`, `CFPropertyList` binary format 1.0) containing dataset metadata and schema definitions.
-3. **Audio Payload (Remaining bytes):** A contiguous array of exactly `TotalNumCoordinates` spatial records containing coordinate positions, PCM filter coefficients, and channel delays.
-
-```
-+---------------------------+-----------------------------------+------------------------------------------+
-| Header: uint32_le (4 B)   | Metadata Block: bplist00 (length) | Audio Payload (TotalNumCoordinates recs) |
-+---------------------------+-----------------------------------+------------------------------------------+
+```text
+record = float32_le coordinates[D]
+         repeat C times:
+             coefficients[N]  # int16_le or float32_le
+             delay            # float32_le when DelayFormat is present
+record_bytes = 4*D + C*(N*W + T)
+file_bytes = 4 + L + TotalNumCoordinates*record_bytes
 ```
 
----
+There is no padding in any supplied file. Coordinates follow `Dimensions` order, not a fixed azimuth/elevation order. HRIR stores **Elevation, Azimuth**; SEIR stores **Elevation, Azimuth, InputChannel**. Coefficients are planar within each record, and each channel's delay immediately follows its taps. Delay values are samples at SampleRate, not seconds. All eleven supplied files use int16 coefficients, float32 delays, and 48 kHz. Float32 coefficients and absent delay blocks are supported by the research parser but are not represented by an original sample here.
 
-## 2. Metadata Block (`bplist00`)
+The shared reader rejects bad lengths, trailing/truncated data, unsupported encodings and nonfinite record values instead of silently treating unknown formats as float or missing records as zeros.
 
-Located immediately at byte offset `0x04`, the metadata dictionary defines all parameters governing the audio payload:
+## Metadata
 
-### Critical Structural Keys
-* `TotalNumCoordinates` *(integer)*: Total count of spatial coordinate measurement records in the payload.
-* `NumChannels` *(integer)*: Number of audio channels per record (e.g. `2` for binaural).
-* `FilterLength` *(integer)*: Number of PCM impulse response samples per channel.
-* `CoefficientFormat` *(string)*: Data type of raw PCM coefficients: `"int16"` (2 bytes, Little-Endian signed short) or `"float32"` (4 bytes, Little-Endian IEEE 754 float).
-* `DelayFormat` *(string)*: Data type of channel delay values, typically `"float32"` (4 bytes, Little-Endian float).
-* `SampleRate` *(float)*: Sampling rate of the impulses in Hz (e.g., `48000.0`).
-* `FilterScaleFactor` *(float)*: Multiplier used to scale integer PCM values back to normalized floating-point `[-1.0, 1.0]`. Defaults to `1.0`.
-* `Dimensions` *(array of dicts)*: Defines each spatial axis. The length of this array equals `num_dims`.
+| Key | Meaning and scope |
+| --- | --- |
+| TotalNumCoordinates | Number of records; not necessarily unique directions (SEIR has another axis) |
+| NumChannels | Filters per record; two for HRIR/BRIR/Reverb, one for SEIR |
+| FilterLength | Taps per channel |
+| SampleRate | Coefficient and delay sample rate |
+| CoefficientFormat | `int16` or `float32` in the inspected reader |
+| DelayFormat | `float32` in supplied files; absence means no serialized delay field |
+| FilterScaleFactor | Multiplier on decoded values, including floating-point coefficients; not a guarantee of [-1,1] bounds |
+| Dimensions | Name, DefaultValue, Periodicity, Interpolation for each serialized coordinate |
+| UserData | Processing metadata described below |
+| ExtendedMetadata | HRIR sphericalGridWeights and sphericalGridOrder; retain verbatim |
+| AudioChannelLayoutTag | Optional CoreAudio layout; not supplied ear positions |
+| Type / DataLengthBytes | Also used by consolidated containers; ordinary samples have Type=0/DataLengthBytes=0 where present |
 
-### Recognized Coordinate Names in `Dimensions`
-Apple's coordinate parser (`IR::IRCoordinates::getParameterString`) recognizes up to 9 dimension axes:
-* `"Azimuth"` (0)
-* `"Elevation"` (1)
-* `"Distance"` (2)
-* `"ChannelAzimuth"` (3)
-* `"ChannelElevation"` (4)
-* `"DeviceOrientation"` (5)
-* `"Generic"` (6)
-* `"InputChannel"` (7)
-* `"Size"` (8)
+Native `IRCoordinates::getParameterString` recognizes Azimuth, Elevation, Distance, ChannelAzimuth, ChannelElevation, DeviceOrientation, Generic, InputChannel, and Size. Recognition of a coordinate name does not prove every consumer implements it. Supplied room assets use 0, HRIR angular axes use 1 **and triangulation**, and SEIR uses 1 for angles and 0 for InputChannel. Spherical interpolation is also a separate IRDataAttributes setting.
 
-Each dictionary in `Dimensions` contains:
-* `Name` *(string)*: One of the supported coordinate axis names.
-* `DefaultValue` *(float)*: Default coordinate value.
-* `Periodicity` *(float)*: Wrap-around period in degrees (e.g., `360.0` for cyclical azimuth), or `0.0`.
-* `Interpolation` *(integer)*: Spatial interpolation mode (`0` = Nearest, `1` = Linear, `2` = Spherical/VBAP).
+## Scaling and timing
 
-### Optional Metadata Keys
-* `AudioChannelLayoutTag` *(integer)*: CoreAudio `AudioChannelLayoutTag` for speaker positioning or Ambisonics/HOA ordering.
-* `Description` *(string)*: Human-readable dataset description.
-* `UserData` *(dict)*: Resampling and filter options (`ResamplerType`, `quality`, `rmLatencySamples`, `rmPostRingSamples`, `DelayBakedInCoeffs`).
-* `TriangulationData` *(dict)*: Vector-Base Amplitude Panning (VBAP) triangulation mesh data (`NumTriangulations`, `TriVertices`, `TriAssignment`, `TriBinLengths`, `TriBinSerial`).
-* `ImpulseResponses` *(array of dicts)*: Used in consolidated multi-IR container files, where each item specifies an IR `Type` and `DataLengthBytes`.
+Three useful representations must stay distinct:
 
----
+1. Raw stored values.
+2. Stored-amplitude coefficients: `raw * FilterScaleFactor`.
+3. Recovered loader coefficients: `raw * FilterScaleFactor / DiffuseFieldPowerRMS`, when that field exists and its absolute value exceeds `2^-23`; otherwise use the scale alone.
 
-## 3. Audio Payload Layout
+Both HRIRs specify RMS 1.412538. Do not peak-normalize or clip these filters.
 
-Immediately following the `bplist` at byte offset `4 + length` is a contiguous sequence of `TotalNumCoordinates` records without padding.
+`DelayBakedInCoeffs` means delay is already in the coefficients; it does **not** mean a serialized delay block is absent. General HRIR has ModelingDelay=48 and baked delay; Movie HRIR has separate fractional delays and no ModelingDelay key. General has 128 taps, Movie 64. The stored delay values remain available even when an export's additional delay is zero.
 
-### 3.1 Record Internal Structure
+`ModelingDelay` is not an instruction to prepend that number of zeros to the original taps. The headphone path accounts for modeling delay in alignment. Native loader option `IRDataAttributes +17` can bake delay using a fixed five-sample stage for already-baked coefficients, or an 11-tap/128-phase sinc stage otherwise. The real-time headphone path also has its own delay processing. Those operations are not implicit parts of the on-disk record.
 
-Each spatial record contains the coordinates followed by **per-channel blocks**. In Apple's implementation, **each channel's coefficients are immediately followed by that channel's delay value**:
+The static General/Movie reconstruction aligns room paths by 53/5 samples respectively and uses a 100-sample half-cosine overlap at early lengths 1536/1024. These are route-dependent processing steps, not changes to the stored IR. Source-extent fields `SourceExtentFilterDelay` and `SourceExtentSizeWeight` belong to SEIR processing; the mono InputChannel-indexed SEIR bank is not a binaural HRTF set.
 
-| Relative Offset | Field | Count | Type | Size (Bytes) |
-| :--- | :--- | :--- | :--- | :--- |
-| `0x00` | Coordinates | `num_dims` | `float32` | `num_dims * 4` |
-| `Coordinates End` | Channel 0 Coefficients | `FilterLength` | `CoefficientFormat` (`int16`/`float32`) | `FilterLength * sizeof(coeff)` |
-| `Ch 0 Coeffs End` | Channel 0 Delay | `1` | `DelayFormat` (`float32`) | `4` |
-| `Ch 0 Delay End` | Channel 1 Coefficients | `FilterLength` | `CoefficientFormat` (`int16`/`float32`) | `FilterLength * sizeof(coeff)` |
-| `Ch 1 Coeffs End` | Channel 1 Delay | `1` | `DelayFormat` (`float32`) | `4` |
-| `...` | `...` | `...` | `...` | `...` |
-| `Ch N-1 End` | Channel N-1 Delay | `1` | `DelayFormat` (`float32`) | `4` |
+## Triangulation: mixed endianness
 
-### 3.2 Total Record Size
+Both HRIR files carry one mesh with 5680 triangles for 2842 records:
 
-$$\text{Bytes Per Record} = (\text{num\_dims} \times 4) + \text{NumChannels} \times \Big(\text{FilterLength} \times \text{sizeof(CoefficientFormat)} + \text{sizeof(DelayFormat)}\Big)$$
+- `TriVertices[0]`: 68,160 bytes, triples of **big-endian 32-bit record indices**.
+- `TriAssignment`: 11,368 bytes, one big-endian 32-bit mesh assignment per record; all zero here.
+- `TriBinLengths[0]`: 8,192 bytes of big-endian 32-bit bin lengths.
+- `TriBinSerial[0]`: packed big-endian 32-bit triangle indices for those bins.
 
-For a standard 2-channel `int16` impulse response with 1 coordinate dimension (Azimuth) and `FilterLength = 768`:
-* Coordinate: $1 \times 4 = 4\text{ bytes}$
-* Channel 0: $(768 \times 2) + 4 = 1540\text{ bytes}$
-* Channel 1: $(768 \times 2) + 4 = 1540\text{ bytes}$
-* Total per record: $4 + 1540 + 1540 = 3084\text{ bytes}$
+The native loader byte-swaps all these integer streams. This does not change the little-endian encoding of audio records. Triangle interpolation uses spherical directions, inverse bases, containment tolerance, and normalized weights; merely applying independent linear azimuth/elevation interpolation loses the mesh behavior. The research player scans triangles instead of reproducing the native acceleration bins.
 
-### 3.3 Structural Representation (C/C++)
+## Consolidated IRs and sound profiles
 
-```c
-// Layout of a single channel's block within a record
-struct IRChannelData {
-    int16_t   coefficients[FilterLength]; // or float32_t when CoefficientFormat == "float32"
-    float32_t delay;                      // Single channel delay (DelayFormat)
-};
-
-// Layout of a single spatial record
-struct IRRecord {
-    float32_t     coordinates[num_dims];
-    IRChannelData channels[NumChannels];
-};
-```
+`extractIRDataTypePlist` reads `ImpulseResponses`, selects a matching Type and accumulates preceding entries' DataLengthBytes to find its payload. A requested Type of zero returns the outer dictionary directly. Therefore the ordinary single-record-bank formula must not be blindly applied to consolidated sound profiles. Native serialization and sound-profile methods exist; no consolidated original sample is included here, and the standalone Python IR reader explicitly rejects that container rather than misdecoding it.
